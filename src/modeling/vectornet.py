@@ -157,15 +157,15 @@ class VectorNet(nn.Module):
 
         if args.argoverse:
             utils.batch_init(mapping)
-
+        # 输出都是list[tensor]: subgraph全部特征[num_polylines,128], subgraph地图特征[n_lane_polylines,128]
         element_states_batch, lane_states_batch = self.forward_encode_sub_graph(mapping, matrix, polyline_spans, device, batch_size)
-
+        # 因为各polyline数量不同,需要padding: inputs:subgraph全部特征,shape=[batch,max_polylines,128], inputs_lengths:list[polyline实际数量]
         inputs, inputs_lengths = utils.merge_tensors(element_states_batch, device=device)
         max_poly_num = max(inputs_lengths)
         attention_mask = torch.zeros([batch_size, max_poly_num, max_poly_num], device=device)
         for i, length in enumerate(inputs_lengths):
-            attention_mask[i][:length][:length].fill_(1)
-
+            attention_mask[i][:length][:length].fill_(1) # 因为用了padding，所以需要把不合法的polyline标记成0
+        # hidden_states,shape=[batch,max_polylines,128]
         hidden_states = self.global_graph(inputs, attention_mask, mapping)
 
         utils.logging('time3', round(time.time() - starttime, 2), 'secs')
