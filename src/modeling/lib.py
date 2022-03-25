@@ -135,7 +135,7 @@ class CrossAttention(GlobalGraph):
         mixed_key_layer = self.key(hidden_states_key)
         mixed_value_layer = self.value(hidden_states_key)
 
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        query_layer = self.transpose_for_scores(mixed_query_layer) # (batch, head, max_vector_num, head_size), head维度不参与att
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
@@ -146,10 +146,10 @@ class CrossAttention(GlobalGraph):
                    and hidden_states_key.shape[1] == attention_mask.shape[2]
             attention_scores = attention_scores + self.get_extended_attention_mask(attention_mask)
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
-        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = torch.matmul(attention_probs, value_layer) # [batch, head, query_dim, feat]
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[
-                                  :-2] + (self.all_head_size,)
+                                  :-2] + (self.all_head_size,) # all_head_size = head * feat
         context_layer = context_layer.view(*new_context_layer_shape)
         if return_scores:
             return context_layer, torch.squeeze(attention_probs, dim=1)
