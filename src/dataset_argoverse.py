@@ -50,7 +50,7 @@ def get_sub_map(args: utils.Args, x, y, city_name, vectors=[], polyline_spans=[]
 
     if args.not_use_api:
         pass
-    else:
+    else: # 选择这个：
         assert isinstance(am, ArgoverseMap)
         if 'semantic_lane' in args.other_params:
             lane_ids = am.get_lane_ids_in_xy_bbox(x, y, city_name, query_search_range_manhattan=args.max_distance)
@@ -111,12 +111,12 @@ def get_sub_map(args: utils.Args, x, y, city_name, vectors=[], polyline_spans=[]
         def get_hash(point):
             return round((point[0] + 500) * 100) * 1000000 + round((point[1] + 500) * 100)
 
-        lane_idx_2_polygon_idx = {}
+        lane_idx_2_polygon_idx = {} # 地图里的lane idx映射到local index（从零开始）
         for polygon_idx, lane_idx in enumerate(lane_ids):
             lane_idx_2_polygon_idx[lane_idx] = polygon_idx
 
         if 'goals_2D' in args.other_params:
-            points = []
+            points = [] # points is list of 2Darray, 所有polygon都存放在一起。
             visit = {}
             point_idx_2_unit_vector = []
 
@@ -130,9 +130,9 @@ def get_sub_map(args: utils.Args, x, y, city_name, vectors=[], polyline_spans=[]
                         points.append(point)
 
                 if 'subdivide' in args.other_params:
-                    subdivide_points = get_subdivide_points(polygon)
-                    points.extend(subdivide_points)
-                    subdivide_points = get_subdivide_points(polygon, include_self=True)
+                    subdivide_points = get_subdivide_points(polygon) # 传进来一个polygon [num_points, 2], 进行更多点的采样，确保两点间距小于1.0，然后传回采样点。
+                    points.extend(subdivide_points) # subdivide_points is list of 2Darray
+                    subdivide_points = get_subdivide_points(polygon, include_self=True) # 传回的点也包括“传入的点”，否则是不包括的。
 
             mapping['goals_2D'] = np.array(points)
 
@@ -153,14 +153,14 @@ def get_sub_map(args: utils.Args, x, y, city_name, vectors=[], polyline_spans=[]
                 lane_segment = am.city_lane_centerlines_dict[city_name][lane_id]
             assert_(len(polygon) >= 2)
             for i, point in enumerate(polygon):
-                if i > 0:
+                if i > 0: # 【...y_pprev x_pprev intersect turn traffic_control polyline_id pt_id(node id) ? y1 x1 y0 x0】
                     vector = [0] * args.hidden_size
                     vector[-1 - VECTOR_PRE_X], vector[-1 - VECTOR_PRE_Y] = point_pre[0], point_pre[1]
                     vector[-1 - VECTOR_X], vector[-1 - VECTOR_Y] = point[0], point[1]
                     vector[-5] = 1
                     vector[-6] = i
 
-                    vector[-7] = len(polyline_spans)
+                    vector[-7] = len(polyline_spans) # polyline id
 
                     if 'semantic_lane' in args.other_params:
                         vector[-8] = 1 if lane_segment.has_traffic_control else -1
@@ -266,7 +266,7 @@ def preprocess(args, id2info, mapping):
                 # print(x-line_pre[X], y-line_pre[Y])
                 vector = [line_pre[X], line_pre[Y], x, y, line[TIMESTAMP], line[OBJECT_TYPE] == 'AV',
                           line[OBJECT_TYPE] == 'AGENT', line[OBJECT_TYPE] == 'OTHERS', len(polyline_spans), i]
-                vectors.append(get_pad_vector(vector))
+                vectors.append(get_pad_vector(vector)) # 存储agent每个node的feature，并且padding 0到长度128
             line_pre = line
 
         end = len(vectors)
@@ -275,7 +275,7 @@ def preprocess(args, id2info, mapping):
         else:
             mapping['agents'].append(np.array(agent))
 
-            polyline_spans.append([start, end])
+            polyline_spans.append([start, end]) # 因为vectors存储的node feature是不区分“polyline”的，所以需要记录下起止位置（对应vectors的行）。
 
     assert_(len(mapping['agents']) == len(polyline_spans))
 
@@ -290,7 +290,7 @@ def preprocess(args, id2info, mapping):
 
     # logging('len(vectors)', t, len(vectors), prob=0.01)
 
-    matrix = np.array(vectors)
+    matrix = np.array(vectors) # vectors里每一个元素是一个node的feature（dim=128）， matrix [num_nodes, feats=128]
     # matrix = np.array(vectors, dtype=float)
     # del vectors
 
@@ -301,13 +301,13 @@ def preprocess(args, id2info, mapping):
 
     labels = []
     info = id2info['AGENT']
-    info = info[mapping['agent_pred_index']:]
+    info = info[mapping['agent_pred_index']:] # 把“20：”位置的30个“未来”位置拿出来
     if not args.do_test:
         if 'set_predict' in args.other_params:
             pass
         else:
             assert len(info) == 30
-    for line in info:
+    for line in info: # labels存储着未来的路径坐标 [x0 y0 x1 y1 ... x29 y29]
         labels.append(line[X])
         labels.append(line[Y])
 
@@ -316,26 +316,26 @@ def preprocess(args, id2info, mapping):
             labels = [0.0 for _ in range(60)]
 
     if 'goals_2D' in args.other_params:
-        point_label = np.array(labels[-2:])
-        mapping['goals_2D_labels'] = np.argmin(get_dis(mapping['goals_2D'], point_label))
+        point_label = np.array(labels[-2:]) # final point x,y
+        mapping['goals_2D_labels'] = np.argmin(get_dis(mapping['goals_2D'], point_label)) # 离gt位置最近的goal的index
 
         if 'stage_one' in args.other_params:
             stage_one_label = 0
-            polygons = mapping['polygons']
+            polygons = mapping['polygons'] # list of 2D array, list数量是polyline， 2d array shape=[num_nodes, 2]
             min_dis = 10000.0
             for i, polygon in enumerate(polygons):
                 temp = np.min(get_dis(polygon, point_label))
-                if temp < min_dis:
+                if temp < min_dis: # 找到和point_label距离最近的polygon，记录其距离，polygon id
                     min_dis = temp
                     stage_one_label = i
 
-            mapping['stage_one_label'] = stage_one_label
+            mapping['stage_one_label'] = stage_one_label # gt路径最末点所在polygon id
 
     mapping.update(dict(
-        matrix=matrix,
-        labels=np.array(labels).reshape([30, 2]),
-        polyline_spans=[slice(each[0], each[1]) for each in polyline_spans],
-        labels_is_valid=np.ones(args.future_frame_num, dtype=np.int64),
+        matrix=matrix, # feat [n_nodes(traj + map), 128]
+        labels=np.array(labels).reshape([30, 2]), # gt traj
+        polyline_spans=[slice(each[0], each[1]) for each in polyline_spans], # list of slice(slice记录一个polyline的再matrix中的起止位置)
+        labels_is_valid=np.ones(args.future_frame_num, dtype=np.int64), # gt validance [30, 2]
         eval_time=30,
     ))
 
@@ -467,7 +467,7 @@ class Dataset(torch.utils.data.Dataset):
                         if file.endswith("csv"):
                             with open(file, "r", encoding='utf-8') as fin:
                                 lines = fin.readlines()[1:]
-                            instance = argoverse_get_instance(lines, file, args)
+                            instance = argoverse_get_instance(lines, file, args) #读取、处理csv数据
                             if instance is not None:
                                 data_compress = zlib.compress(pickle.dumps(instance))
                                 res.append(data_compress)
