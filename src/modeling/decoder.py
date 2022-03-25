@@ -48,12 +48,12 @@ class Decoder(nn.Module):
 
         self.decoder = DecoderRes(hidden_size, out_features=2)
 
-        if 'variety_loss' in args.other_params:
+        if 'variety_loss' in args.other_params: # pass
             self.variety_loss_decoder = DecoderResCat(hidden_size, hidden_size, out_features=6 * self.future_frame_num * 2)
 
             if 'variety_loss-prob' in args.other_params:
                 self.variety_loss_decoder = DecoderResCat(hidden_size, hidden_size, out_features=6 * self.future_frame_num * 2 + 6)
-        elif 'goals_2D' in args.other_params:
+        elif 'goals_2D' in args.other_params: # true
             # self.decoder = DecoderResCat(hidden_size, hidden_size, out_features=self.future_frame_num * 2)
             self.goals_2D_mlps = nn.Sequential(
                 MLP(2, hidden_size),
@@ -65,12 +65,12 @@ class Decoder(nn.Module):
             self.goals_2D_cross_attention = CrossAttention(hidden_size)
             if 'point_sub_graph' in args.other_params:
                 self.goals_2D_point_sub_graph = PointSubGraph(hidden_size)
-        if 'stage_one' in args.other_params:
-            self.stage_one_cross_attention = CrossAttention(hidden_size)
+        if 'stage_one' in args.other_params: # ture
+            self.stage_one_cross_attention = CrossAttention(hidden_size) # 128
             self.stage_one_decoder = DecoderResCat(hidden_size, hidden_size * 3, out_features=1)
             self.stage_one_goals_2D_decoder = DecoderResCat(hidden_size, hidden_size * 4, out_features=1)
 
-        if 'set_predict' in args.other_params:
+        if 'set_predict' in args.other_params: # true
             if args.do_train:
                 if 'set_predict-train_recover' in args.other_params:
                     model_recover = torch.load(args.other_params['set_predict-train_recover'])
@@ -93,30 +93,42 @@ class Decoder(nn.Module):
     def goals_2D_per_example_stage_one(self, i, mapping, lane_states_batch, inputs, inputs_lengths,
                                        hidden_states, device, loss):
         def get_stage_one_scores():
-            stage_one_hidden = lane_states_batch[i]
-            stage_one_hidden_attention = self.stage_one_cross_attention(
-                stage_one_hidden.unsqueeze(0), inputs[i][:inputs_lengths[i]].unsqueeze(0)).squeeze(0)
-            stage_one_scores = self.stage_one_decoder(torch.cat([hidden_states[i, 0, :].unsqueeze(0).expand(
-                stage_one_hidden.shape), stage_one_hidden, stage_one_hidden_attention], dim=-1))
+            stage_one_hidden = lane_states_batch[i] # subgraph的map特征
+
+            # inputs：均是subgraph特征。一个是map特征，一个是合法的all特征。
+            # output：map的att特征 shape=[map_polylines, 128]。
+            stage_one_hidden_attention = self.stage_one_cross_attention( 
+                stage_one_hidden.unsqueeze(0), 
+                inputs[i][:inputs_lengths[i]].unsqueeze(0)
+            ).squeeze(0)
+            # 残差MLP
+            stage_one_scores = self.stage_one_decoder(
+                torch.cat([
+                    hidden_states[i, 0, :].unsqueeze(0).expand(stage_one_hidden.shape), 
+                    stage_one_hidden, 
+                    stage_one_hidden_attention], 
+                dim=-1))
             stage_one_scores = stage_one_scores.squeeze(-1)
             stage_one_scores = F.log_softmax(stage_one_scores, dim=-1)
             return stage_one_scores
 
-        stage_one_scores = get_stage_one_scores()
+        stage_one_scores = get_stage_one_scores() # 地图polylines的分数 [num_map_polylines(nPLs)]
         assert len(stage_one_scores) == len(mapping[i]['polygons'])
-        mapping[i]['stage_one_scores'] = stage_one_scores
+        mapping[i]['stage_one_scores'] = stage_one_scores # [nPLs,]
         # print('stage_one_scores', stage_one_scores.requires_grad)
-        loss[i] += F.nll_loss(stage_one_scores.unsqueeze(0),
+        
+        # 计算negative log likelihood loss。这个loss是让model学习识别出最佳PL（最高score）。
+        loss[i] += F.nll_loss(stage_one_scores.unsqueeze(0), # [1,nPL]
                               torch.tensor([mapping[i]['stage_one_label']], device=device))
         # print('stage_one_scores-2', loss[i].requires_grad)
-        if 'stage_one_dynamic' in args.other_params:
-            _, stage_one_topk_ids = torch.topk(stage_one_scores, k=len(stage_one_scores))
+        if 'stage_one_dynamic' in args.other_params: # true
+            _, stage_one_topk_ids = torch.topk(stage_one_scores, k=len(stage_one_scores)) # sort with log likelihood
             threshold = float(args.other_params['stage_one_dynamic'])
             sum = 0.0
             for idx, each in enumerate(torch.exp(stage_one_scores[stage_one_topk_ids])):
                 sum += each
-                if sum > threshold:
-                    stage_one_topk_ids = stage_one_topk_ids[:idx + 1]
+                if sum > threshold: # 0.95
+                    stage_one_topk_ids = stage_one_topk_ids[:idx + 1] # 选取前k个map polyline id，他们的score相加之和大于0.95
                     break
             utils.other_errors_put('stage_one_k', len(stage_one_topk_ids))
         else:
@@ -127,10 +139,10 @@ class Decoder(nn.Module):
         else:
             utils.other_errors_put('stage_one_recall', 0.0)
 
-        stage_one_topk = lane_states_batch[i][stage_one_topk_ids]
+        stage_one_topk = lane_states_batch[i][stage_one_topk_ids] # 排序后的subgraph地图特征 [nPLs', 128], nPLs'<=nPLs
         mapping[i]['stage_one_topk'] = stage_one_topk
 
-        return stage_one_topk_ids
+        return stage_one_topk_ids # 选取的PL id
 
     def goals_2D_per_example_lazy_points(self, i, goals_2D, mapping, labels, device, scores,
                                          get_scores_inputs, stage_one_topk_ids=None, gt_points=None):
@@ -140,7 +152,7 @@ class Decoder(nn.Module):
             k = 40
         _, topk_ids = torch.topk(scores, k=min(k, len(scores)))
         topk_ids = topk_ids.tolist()
-
+        # 对每个goal point的sample前后左右2.0米范围的所有point。
         goals_2D_new = utils.get_neighbour_points(goals_2D[topk_ids], topk_ids=topk_ids, mapping=mapping[i])
 
         goals_2D_new = torch.cat([torch.tensor(goals_2D_new, device=device, dtype=torch.float),
@@ -155,7 +167,7 @@ class Decoder(nn.Module):
 
         index = torch.argmax(scores).item()
         point = np.array(goals_2D_new[index].tolist())
-
+        # 在扩充过的goal candidates中，选取一个goal，它和当前AGENT gt goal最近。
         if not args.do_test:
             label = np.array(labels[i]).reshape([self.future_frame_num, 2])
             final_idx = mapping[i].get('final_idx', -1)
@@ -170,10 +182,10 @@ class Decoder(nn.Module):
         """
         Calculate loss for a training example
         """
-        final_idx = mapping[i].get('final_idx', -1)
+        final_idx = mapping[i].get('final_idx', -1) # 选用默认-1
         gt_goal = gt_points[final_idx]
         DE[i][final_idx] = np.sqrt((highest_goal[0] - gt_points[final_idx][0]) ** 2 + (highest_goal[1] - gt_points[final_idx][1]) ** 2)
-        if 'complete_traj' in args.other_params:
+        if 'complete_traj' in args.other_params: # true
             target_feature = self.goals_2D_mlps(torch.tensor(gt_points[final_idx], dtype=torch.float, device=device))
             pass
             if True:
@@ -186,7 +198,7 @@ class Decoder(nn.Module):
                     [self.future_frame_num, 2])
             loss[i] += (F.smooth_l1_loss(predict_traj, torch.tensor(gt_points, dtype=torch.float, device=device), reduction='none') * \
                         torch.tensor(labels_is_valid[i], dtype=torch.float, device=device).view(self.future_frame_num, 1)).mean()
-
+        # goals_2D_labels：上步candidates中和GT最近的。训练model能生成更好的score，以选取goal离GT最近。
         loss[i] += F.nll_loss(scores.unsqueeze(0),
                               torch.tensor([mapping[i]['goals_2D_labels']], device=device))
 
@@ -204,32 +216,39 @@ class Decoder(nn.Module):
         :param DE: displacement error (shape [batch_size, self.future_frame_num])
         """
         if args.do_train:
-            final_idx = mapping[i].get('final_idx', -1)
-            assert labels_is_valid[i][final_idx]
+            final_idx = mapping[i].get('final_idx', -1) # 用默认的-1
+            assert labels_is_valid[i][final_idx] # 最末点需是合法
 
-        gt_points = labels[i].reshape([self.future_frame_num, 2])
+        gt_points = labels[i].reshape([self.future_frame_num, 2]) # [30,2]
 
-        stage_one_topk_ids = None
-        if 'stage_one' in args.other_params:
-            stage_one_topk_ids = self.goals_2D_per_example_stage_one(i, mapping, lane_states_batch, inputs, inputs_lengths,
+        stage_one_topk_ids = None # top-k个地图PL id
+        if 'stage_one' in args.other_params: # true
+            stage_one_topk_ids = self.goals_2D_per_example_stage_one(i, mapping, lane_states_batch, 
+                                                                     inputs, inputs_lengths,
                                                                      hidden_states, device, loss)
 
         goals_2D_tensor = torch.tensor(goals_2D, device=device, dtype=torch.float)
         get_scores_inputs = (inputs, hidden_states, inputs_lengths, i, mapping, device)
 
+        # 为每个goals，计算scores
         scores = self.get_scores(goals_2D_tensor, *get_scores_inputs)
         index = torch.argmax(scores).item()
+        # 最优goal坐标, shape=[2]
         highest_goal = goals_2D[index]
 
+        # 从goal中选取topK，再扩展其数量，然后计算其分数并选取最优的goal。
+        # scores: 候选goal的分数, highest_goal: 分数最佳的goal, goals_2D: 候选goal
         if 'lazy_points' in args.other_params:
-            scores, highest_goal, goals_2D = \
-                self.goals_2D_per_example_lazy_points(i, goals_2D, mapping, labels, device, scores,
-                                                      get_scores_inputs, stage_one_topk_ids, gt_points)
+            scores, highest_goal, goals_2D = self.goals_2D_per_example_lazy_points(
+                    i, goals_2D, mapping, labels, device, scores,
+                    get_scores_inputs, stage_one_topk_ids, gt_points)
             index = None
 
+        # 计算loss以优化model生成更合理的scores
         if args.do_train:
             self.goals_2D_per_example_calc_loss(i, goals_2D, mapping, inputs, inputs_lengths,
-                                                hidden_states, device, loss, DE, gt_points, scores, highest_goal, labels_is_valid)
+                                                hidden_states, device, loss, DE, gt_points, 
+                                                scores, highest_goal, labels_is_valid)
 
         if args.visualize:
             mapping[i]['vis.goals_2D'] = goals_2D
@@ -238,6 +257,7 @@ class Decoder(nn.Module):
             mapping[i]['vis.labels_is_valid'] = labels_is_valid[i]
 
         if 'set_predict' in args.other_params:
+            # loss会被置零，此前stage1、stage2计算得到的loss都不作数。
             self.run_set_predict(goals_2D, scores, mapping, device, loss, i)
             if args.visualize:
                 set_predict_ans_points = mapping[i]['set_predict_ans_points']
@@ -350,16 +370,16 @@ class Decoder(nn.Module):
         :param inputs_lengths: valid element number of each example
         :param hidden_states: hidden states of all elements after encoding by global graph (shape [batch_size, 'element num', hidden_size])
         """
-        labels = utils.get_from_mapping(mapping, 'labels')
+        labels = utils.get_from_mapping(mapping, 'labels') # [30, 2]
         labels_is_valid = utils.get_from_mapping(mapping, 'labels_is_valid')
         loss = torch.zeros(batch_size, device=device)
         DE = np.zeros([batch_size, self.future_frame_num])
 
-        if 'variety_loss' in args.other_params:
+        if 'variety_loss' in args.other_params: # pass
             return self.variety_loss(mapping, hidden_states, batch_size, inputs, inputs_lengths, labels_is_valid, loss, DE, device, labels)
-        elif 'goals_2D' in args.other_params:
+        elif 'goals_2D' in args.other_params: # true
             for i in range(batch_size):
-                goals_2D = mapping[i]['goals_2D']
+                goals_2D = mapping[i]['goals_2D'] # batch-i的所有goal points
 
                 self.goals_2D_per_example(i, goals_2D, mapping, lane_states_batch, inputs, inputs_lengths,
                                           hidden_states, labels, labels_is_valid, device, loss, DE)
@@ -395,24 +415,35 @@ class Decoder(nn.Module):
         :param goals_2D_tensor: candidate goals sampled from map (shape ['goal num', 2])
         :return: log scores of goals (shape ['goal num'])
         """
-        if 'point_sub_graph' in args.other_params:
-            goals_2D_hidden = self.goals_2D_point_sub_graph(goals_2D_tensor.unsqueeze(0), hidden_states[i, 0:1, :]).squeeze(0)
+        if 'point_sub_graph' in args.other_params: # true
+            # goals_2D_hidden: shape=[num_goals, 128], 这里的goals是从map的车道中心线基础上计算得到的。
+            goals_2D_hidden = self.goals_2D_point_sub_graph(
+                goals_2D_tensor.unsqueeze(0), 
+                hidden_states[i, 0:1, :]
+            ).squeeze(0)
         else:
             goals_2D_hidden = self.goals_2D_mlps(goals_2D_tensor)
-
+        # 把goal特征作为query，和subgraph的总特征做为key和value，计算goal的注意力特征。
         goals_2D_hidden_attention = self.goals_2D_cross_attention(
             goals_2D_hidden.unsqueeze(0), inputs[i][:inputs_lengths[i]].unsqueeze(0)).squeeze(0)
 
         if 'stage_one' in args.other_params:
-            stage_one_topk = mapping[i]['stage_one_topk']
-            stage_one_scores = mapping[i]['stage_one_scores']
+            stage_one_topk = mapping[i]['stage_one_topk'] # topK的subgraph map特征 [topK map polyline数量, 128]
+            stage_one_scores = mapping[i]['stage_one_scores'] # topK的map polyline ids
             stage_one_topk_here = stage_one_topk
+            
             stage_one_goals_2D_hidden_attention = self.goals_2D_cross_attention(
-                goals_2D_hidden.unsqueeze(0), stage_one_topk_here.unsqueeze(0)).squeeze(0)
-            li = [hidden_states[i, 0, :].unsqueeze(0).expand(goals_2D_hidden.shape),
-                  goals_2D_hidden, goals_2D_hidden_attention, stage_one_goals_2D_hidden_attention]
+                goals_2D_hidden.unsqueeze(0), 
+                stage_one_topk_here.unsqueeze(0) # 车道subgraph特征
+            ).squeeze(0)
 
-            scores = self.stage_one_goals_2D_decoder(torch.cat(li, dim=-1))
+            li = [hidden_states[i, 0, :].unsqueeze(0).expand(goals_2D_hidden.shape),
+                  goals_2D_hidden, 
+                  goals_2D_hidden_attention, 
+                  stage_one_goals_2D_hidden_attention]
+            
+            # 计算每一个goal的分数。scores shape=[goals数量]
+            scores = self.stage_one_goals_2D_decoder(torch.cat(li, dim=-1)) 
         else:
             scores = self.goals_2D_decoder(torch.cat([hidden_states[i, 0, :].unsqueeze(0).expand(
                 goals_2D_hidden.shape), goals_2D_hidden, goals_2D_hidden_attention], dim=-1))
@@ -423,7 +454,7 @@ class Decoder(nn.Module):
 
     def run_set_predict(self, goals_2D, scores, mapping, device, loss, i):
         gt_points = mapping[i]['labels'].reshape((self.future_frame_num, 2))
-
+        # 以scores大小为goals_2D和scores排序:
         if args.argoverse:
             if 'set_predict-topk' in args.other_params:
                 topk_num = args.other_params['set_predict-topk']
@@ -432,8 +463,8 @@ class Decoder(nn.Module):
                     topk_num = torch.sum(scores > np.log(0.00001)).item()
 
                 _, topk_ids = torch.topk(scores, k=min(topk_num, len(scores)))
-                goals_2D = goals_2D[topk_ids.cpu().numpy()]
-                scores = scores[topk_ids]
+                goals_2D = goals_2D[topk_ids.cpu().numpy()] # 排序后的goal
+                scores = scores[topk_ids] # 排序后的score
 
         scores_positive_np = np.exp(np.array(scores.tolist(), dtype=np.float32))
         goals_2D = goals_2D.astype(np.float32)
@@ -444,79 +475,88 @@ class Decoder(nn.Module):
 
         vectors_3D[:, 0] -= goals_2D[max_point_idx, 0]
         vectors_3D[:, 1] -= goals_2D[max_point_idx, 1]
-
+        # 输入的vectors_3D是goal坐标和对应的score分数
+        # MLP(3, 128) => [num_goals, 128]
         points_feature = self.set_predict_point_feature(vectors_3D)
-        costs = np.zeros(args.other_params['set_predict'])
+        costs = np.zeros(args.other_params['set_predict']) # costs[6,]
         pseudo_labels = []
-        predicts = []
+        predicts = [] # 6个head对应的goal set
 
         set_predict_trajs_list = []
-        group_scores = torch.zeros([len(self.set_predict_encoders)], device=device)
+        group_scores = torch.zeros([len(self.set_predict_encoders)], device=device) # 6个分数 [6,]
 
         start_time = utils.time.time()
 
-        if True:
+        if True: # head k=6
             for k, (encoder, decoder) in enumerate(zip(self.set_predict_encoders, self.set_predict_decoders)):
                 if 'set_predict-one_encoder' in args.other_params:
                     encoder = self.set_predict_encoders[0]
 
                 if True:
+                    # 除了第一次encode之外，剩余的几个head都用同样的encoding。
                     if 'set_predict-one_encoder' in args.other_params and k > 0:
                         pass
                     else:
-                        encoding = encoder(points_feature.unsqueeze(0)).squeeze(0)
-
-                    decoding = decoder(torch.cat([torch.max(encoding, dim=0)[0], torch.mean(encoding, dim=0)], dim=-1)).view([13])
-                    group_scores[k] = decoding[0]
-                    predict = decoding[1:].view([6, 2])
-
+                        encoding = encoder(points_feature.unsqueeze(0)).squeeze(0) # encoding[num_goals, 128]
+                    # 输出decoding[13,], 用encoding特征的最大、均值作为输入做decode：
+                    decoding = decoder(torch.cat([torch.max(encoding, dim=0)[0], 
+                                                  torch.mean(encoding, dim=0)], dim=-1)).view([13])
+                    group_scores[k] = decoding[0] # [1,] 置信度
+                    predict = decoding[1:].view([6, 2]) # [6,2] 预测的6个goal坐标（的offset）
+                    # 恢复成实际坐标
                     predict[:, 0] += goals_2D[max_point_idx, 0]
                     predict[:, 1] += goals_2D[max_point_idx, 1]
-
+                # 将k=6个goal坐标放到n=6个head上
                 predicts.append(predict)
 
                 if args.do_eval:
                     pass
                 else:
-                    selected_points = np.array(predict.tolist(), dtype=np.float32)
+                    selected_points = np.array(predict.tolist(), dtype=np.float32) # goal_set[6,2]
                     temp = None
                     assert goals_2D.dtype == np.float32, goals_2D.dtype
                     kwargs = None
                     if 'set_predict-MRratio' in args.other_params:
                         kwargs = {}
                         kwargs['set_predict-MRratio'] = args.other_params['set_predict-MRratio']
-                    costs[k] = utils_cython.set_predict_get_value(goals_2D, scores_positive_np, selected_points, kwargs=kwargs)
-
+                    # 为每个head的goal set计算分数
+                    costs[k] = utils_cython.set_predict_get_value(goals_2D, scores_positive_np, 
+                                                                  selected_points, kwargs=kwargs)
                     pseudo_labels.append(temp)
 
         argmin = torch.argmax(group_scores).item()
 
         if args.do_train:
             utils.other_errors_put('set_hungary', np.min(costs))
-            group_scores = F.log_softmax(group_scores, dim=-1)
-            min_cost_idx = np.argmin(costs)
+            group_scores = F.log_softmax(group_scores, dim=-1) # 每个head的分数,shape=[6,]
+            min_cost_idx = np.argmin(costs) # 选取最优的head
             loss[i] = 0
 
-            if True:
+            if True: 
+                # 只为cost最小的head计算生成pseudo-labels：
                 selected_points = np.array(predicts[min_cost_idx].tolist(), dtype=np.float32)
                 kwargs = None
                 if 'set_predict-MRratio' in args.other_params:
                     kwargs = {}
                     kwargs['set_predict-MRratio'] = args.other_params['set_predict-MRratio']
+                # 在最优head的goal_set基础上，调整goal_set, shape=[6,2]
                 _, dynamic_label = utils_cython.set_predict_next_step(goals_2D, scores_positive_np, selected_points,
                                                                       lr=args.set_predict_lr, kwargs=kwargs)
                 # loss[i] += 2.0 / globals.set_predict_lr * \
                 #            F.l1_loss(predicts[min_cost_idx], torch.tensor(dynamic_label, device=device, dtype=torch.float))
-                loss[i] += 2.0 * F.l1_loss(predicts[min_cost_idx], torch.tensor(dynamic_label, device=device, dtype=torch.float))
+                # loss: 优化best_head的goal_set, 和调整后的goal_set 之间的差异
+                loss[i] += 2.0 * F.l1_loss(predicts[min_cost_idx], 
+                                           torch.tensor(dynamic_label, device=device, dtype=torch.float))
+            # 此loss是为优化encode/decode来生成更优的head score，用以选取最优的head。
+            loss[i] += F.nll_loss(group_scores.unsqueeze(0), 
+                                  torch.tensor([min_cost_idx], device=device))
 
-            loss[i] += F.nll_loss(group_scores.unsqueeze(0), torch.tensor([min_cost_idx], device=device))
-
-            t = np.array(predicts[min_cost_idx].tolist())
+            t = np.array(predicts[min_cost_idx].tolist()) # [6,2]
 
             utils.other_errors_put('set_MR_mincost', np.min(utils.get_dis_point_2_points(gt_points[-1], t)) > 2.0)
             utils.other_errors_put('set_minFDE_mincost', np.min(utils.get_dis_point_2_points(gt_points[-1], t)))
 
-        predict = np.array(predicts[argmin].tolist())
+        predict = np.array(predicts[argmin].tolist()) # [6,2]
 
         set_predict_ans_points = predict.copy()
         li = []
